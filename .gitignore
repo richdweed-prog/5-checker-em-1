@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+proxy_usage.json
+Resultados/
+.env
+*.log
