@@ -105,6 +105,7 @@ def update_usage(response):
 fila_resultados = queue.Queue()
 execucao_ativa = False
 execucao_cancelada = False
+execucao_id = 0
 
 # =========================================
 # API 1 - MEU NUMERO VIRTUAL (MNV)
@@ -615,8 +616,8 @@ def processar_conta(linha, api_escolhida, hotmail_keyword="", hotmail_mode="fast
             return {"numero": f"{email}:{senha}", "status": resultado["status"], "motivo": resultado["motivo"], "saldo": resultado.get("saldo", "N/A"), "dados": resultado.get("dados", {}), "resultados_por_api": None}
         return None
 
-def processar_com_streaming(texto, api_escolhida, quantidade_threads=2, hotmail_keyword="", hotmail_mode="fastest", hotmail_proxy=False):
-    global execucao_cancelada, fila_resultados
+def processar_com_streaming(texto, api_escolhida, quantidade_threads=2, hotmail_keyword="", hotmail_mode="fastest", hotmail_proxy=False, run_id=None):
+    global execucao_cancelada, fila_resultados, execucao_id
     quantidade_threads = int(quantidade_threads)
     linhas = texto.split('\n')
     linhas_validas = [l for l in linhas if l.strip() and ":" in l]
@@ -624,15 +625,17 @@ def processar_com_streaming(texto, api_escolhida, quantidade_threads=2, hotmail_
     processados = 0
     lives = 0
     dies = 0
+    if run_id != execucao_id or execucao_cancelada:
+        return
     fila_resultados.put({"type": "total", "total": total})
     with ThreadPoolExecutor(max_workers=quantidade_threads) as executor:
         futures = []
         for linha in linhas_validas:
-            if execucao_cancelada:
+            if execucao_cancelada or run_id != execucao_id:
                 break
             futures.append(executor.submit(processar_conta, linha, api_escolhida, hotmail_keyword, hotmail_mode, hotmail_proxy))
         for future in futures:
-            if execucao_cancelada:
+            if execucao_cancelada or run_id != execucao_id:
                 break
             item = future.result()
             if item is None:
@@ -642,6 +645,8 @@ def processar_com_streaming(texto, api_escolhida, quantidade_threads=2, hotmail_
                 lives += 1
             else:
                 dies += 1
+            if run_id != execucao_id:
+                break
             fila_resultados.put({
                 "type": "resultado",
                 "item": item,
@@ -650,8 +655,9 @@ def processar_com_streaming(texto, api_escolhida, quantidade_threads=2, hotmail_
                 "lives": lives,
                 "dies": dies
             })
-    fila_resultados.put({"type": "finalizado", "lives": lives, "dies": dies, "total": total})
-    execucao_cancelada = False
+    if run_id == execucao_id:
+        fila_resultados.put({"type": "finalizado", "lives": lives, "dies": dies, "total": total})
+        execucao_cancelada = False
 
 # =========================================
 # ROTAS FLASK
@@ -662,7 +668,7 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_processing():
-    global execucao_ativa, execucao_cancelada, fila_resultados
+    global execucao_ativa, execucao_cancelada, fila_resultados, execucao_id
     data = request.get_json()
     raw_text = data.get('numbers', '')
     api = data.get('api', 'mnv')
@@ -683,10 +689,12 @@ def start_processing():
             break
     execucao_cancelada = False
     execucao_ativa = True
+    execucao_id += 1
+    run_id = execucao_id
     import threading
     thread = threading.Thread(
         target=processar_com_streaming,
-        args=(raw_text, api, quantidade_threads, hotmail_keyword, hotmail_mode, hotmail_proxy),
+        args=(raw_text, api, quantidade_threads, hotmail_keyword, hotmail_mode, hotmail_proxy, run_id),
     )
     thread.daemon = True
     thread.start()
@@ -694,9 +702,15 @@ def start_processing():
 
 @app.route('/stop', methods=['POST'])
 def stop_processing():
-    global execucao_cancelada, execucao_ativa
+    global execucao_cancelada, execucao_ativa, execucao_id
     execucao_cancelada = True
     execucao_ativa = False
+    execucao_id += 1
+    while not fila_resultados.empty():
+        try:
+            fila_resultados.get_nowait()
+        except queue.Empty:
+            break
     return jsonify({"status": "stopped"})
 
 @app.route('/stream')
@@ -1814,13 +1828,26 @@ HTML_TEMPLATE = """
             atualizarContadorCarregado();
         }
 
-        function clearInput() {
-            inputArea.value = "";
+        function resetTestState(clearInputValue = true) {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            if (clearInputValue) inputArea.value = "";
             document.querySelectorAll('.card-number').forEach(el => el.innerText = "0");
             listLives.innerHTML = '<div class="empty-state">[ AGUARDANDO DADOS ]</div>';
             listDies.innerHTML = '<div class="empty-state">[ AGUARDANDO DADOS ]</div>';
             resultsStore = { lives: [], dies: [] };
+            numLives.innerText = "0";
+            numDies.innerText = "0";
+            numTested.innerText = "0";
+            progressText.textContent = "Aguardando dados...";
+            resetButtons();
             atualizarContadorCarregado();
+        }
+
+        function clearInput() {
+            resetTestState(true);
         }
 
         function pasteClipboard() {
@@ -1997,6 +2024,13 @@ HTML_TEMPLATE = """
                 }
             }).catch(() => resetButtons());
         }
+
+        // O navegador pode restaurar o textarea ao recarregar ou voltar pelo historico.
+        // Cancela a execucao anterior no servidor e inicia a pagina sem resultados antigos.
+        window.addEventListener('pageshow', function() {
+            fetch('/stop', { method: 'POST', keepalive: true }).catch(() => {});
+            resetTestState(true);
+        });
 
         function resetButtons() {
             isProcessing = false;
